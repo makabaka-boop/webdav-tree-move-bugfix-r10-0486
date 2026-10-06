@@ -12,10 +12,11 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from .clock import SystemClock
 from .ifheader import IfHeaderError, parse_if_header, submitted_tokens
+from .movement import move_tree
 from .store import Workspace, norm_path
 
 DAV = "{DAV:}"
@@ -220,9 +221,6 @@ def create_app(db_path: Optional[str] = None, clock=None) -> FastAPI:
 
     @app.post("/api/move", include_in_schema=False)
     async def move(request: Request):
-        from .movement import move_tree
-        from fastapi.responses import JSONResponse
-
         try:
             result = move_tree(ws, await request.json())
         except (ValueError, KeyError, TypeError) as exc:

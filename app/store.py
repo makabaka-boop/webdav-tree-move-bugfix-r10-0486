@@ -57,6 +57,13 @@ def is_ancestor(ancestor: str, path: str) -> bool:
     return path.startswith(ancestor + "/")
 
 
+def parent_path(path: str) -> str:
+    """父路径；根目录的父路径仍是根。"""
+    if path == "/":
+        return "/"
+    return path.rsplit("/", 1)[0] or "/"
+
+
 def lock_covers(lock_path: str, depth_infinity: bool, path: str) -> bool:
     """锁是否覆盖 path：自身（任意深度），或 Depth infinity 锁的全部后代。"""
     if lock_path == path:
@@ -80,6 +87,15 @@ class LockOutcome:
     token: Optional[str] = None
     depth_infinity: bool = False
     timeout: Optional[int] = None  # None 表示 Infinite
+
+
+@dataclass
+class MoveOutcome:
+    # ok | source_not_found | destination_exists | parent_not_collection
+    # | incomplete_versions | version_conflict | locked
+    status: str
+    moved: Optional[list] = None  # 成功时迁移条目的 from/to（文件附未变的 ETag）
+    path: Optional[str] = None  # 失败时冲突涉及的路径（诊断信息）
 
 
 class Workspace:
@@ -250,3 +266,79 @@ class Workspace:
                 return "path_mismatch"
             c.execute("DELETE FROM locks WHERE token = ?", (token,))
             return "ok"
+
+    # ---- MOVE（整棵子树迁移） ----
+
+    def move(
+        self,
+        source: str,
+        destination: str,
+        versions: dict,
+        tokens: set,
+    ) -> MoveOutcome:
+        """把 source（已有文件或完整目录）迁入已存在集合下的空路径 destination。
+
+        版本清单、覆盖源/目标的有效锁与路径重写在同一事务内裁决：
+        整批锁按同一个到期时刻判断，任一条件不满足就整体回滚——
+        目录、文件、正文、版本与锁（令牌、深度、剩余有效期）全部保持原状。
+        成功时正文与 ETag 不因位置变化而改变，源内锁随对应资源迁移。
+        """
+        with self.txn() as c:
+            self._purge_expired(c)  # 同一批操作共用这一个裁决时刻
+            if self._resource(c, source) is None:
+                return MoveOutcome("source_not_found", path=source)
+            if self._resource(c, destination) is not None:
+                return MoveOutcome("destination_exists", path=destination)
+            dest_parent = parent_path(destination)
+            parent = self._resource(c, dest_parent)
+            if parent is None or not parent["is_collection"]:
+                return MoveOutcome("parent_not_collection", path=dest_parent)
+
+            rows = [
+                r
+                for r in c.execute("SELECT * FROM resources ORDER BY path").fetchall()
+                if r["path"] == source or is_ancestor(source, r["path"])
+            ]
+            # 版本清单必须覆盖源子树的每个文件，且与当前强 ETag 一致。
+            for r in rows:
+                if r["is_collection"]:
+                    continue
+                submitted = versions.get(r["path"])
+                if submitted is None:
+                    return MoveOutcome("incomplete_versions", path=r["path"])
+                if submitted != etag_str(r["etag"]):
+                    return MoveOutcome("version_conflict", path=r["path"])
+
+            # 覆盖源子树任一资源、目标路径或目标父目录（成员变更）的有效锁，
+            # 其令牌都必须出现在 tokens 中。
+            locks = c.execute("SELECT * FROM locks").fetchall()
+            covered = [r["path"] for r in rows] + [destination]
+            for l in locks:
+                if l["token"] in tokens:
+                    continue
+                if l["path"] == dest_parent or any(
+                    lock_covers(l["path"], l["depth_infinity"], p) for p in covered
+                ):
+                    return MoveOutcome("locked", path=l["path"])
+
+            # 全部条件满足：只重写路径，正文与版本原样保留。
+            moved = []
+            for r in rows:
+                new_path = destination + r["path"][len(source):]
+                c.execute(
+                    "UPDATE resources SET path = ? WHERE path = ?",
+                    (new_path, r["path"]),
+                )
+                entry = {"from": r["path"], "to": new_path}
+                if not r["is_collection"]:
+                    entry["etag"] = etag_str(r["etag"])
+                moved.append(entry)
+            # 源内锁随对应资源迁移：令牌、深度与到期时刻原样保留。
+            for l in locks:
+                if l["path"] == source or is_ancestor(source, l["path"]):
+                    new_path = destination + l["path"][len(source):]
+                    c.execute(
+                        "UPDATE locks SET path = ? WHERE token = ?",
+                        (new_path, l["token"]),
+                    )
+            return MoveOutcome("ok", moved=moved)
