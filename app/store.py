@@ -82,6 +82,27 @@ class LockOutcome:
     timeout: Optional[int] = None  # None 表示 Infinite
 
 
+@dataclass
+class MoveEntry:
+    src: str
+    dst: str
+    is_collection: bool
+    etag: Optional[str] = None  # 文件迁移时的当前强 ETag；集合为 None
+
+
+class MoveRejected(Exception):
+    """整树迁移在裁决事务内被拒绝；reason 为机器可读的原因码。
+
+    抛出即触发事务回滚——连同过期锁清理在内的一切裁决副作用都不落盘，
+    失败后目录树、文件与锁与请求前完全一致。
+    """
+
+    def __init__(self, reason: str, path: Optional[str] = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.path = path
+
+
 class Workspace:
     def __init__(self, db_path: str, clock):
         self.clock = clock
@@ -112,11 +133,16 @@ class Workspace:
 
     # ---- 内部：必须在事务内调用 ----
 
-    def _purge_expired(self, c: sqlite3.Connection) -> None:
-        """到期判断与锁状态在同一事务内：过期锁立即视为不存在。"""
+    def _purge_expired(self, c: sqlite3.Connection, now: Optional[float] = None) -> None:
+        """到期判断与锁状态在同一事务内：过期锁立即视为不存在。
+
+        显式传入 now 时整批判断共用同一时刻；否则取时钟当前值。
+        """
+        if now is None:
+            now = self.clock.now()
         c.execute(
             "DELETE FROM locks WHERE expires_at IS NOT NULL AND expires_at <= ?",
-            (self.clock.now(),),
+            (now,),
         )
 
     def _resource(self, c: sqlite3.Connection, path: str):
@@ -250,3 +276,116 @@ class Workspace:
                 return "path_mismatch"
             c.execute("DELETE FROM locks WHERE token = ?", (token,))
             return "ok"
+
+    # ---- 整树迁移 ----
+
+    def move_tree(
+        self,
+        source: str,
+        destination: str,
+        versions: dict[str, str],
+        tokens: set[str],
+    ) -> list[MoveEntry]:
+        """单笔事务内完成整棵子树的条件裁决与迁移。
+
+        裁决（过期清理、源/目标结构、版本清单、覆盖锁）全部通过后才改路径；
+        任一条件不满足都抛出 MoveRejected 并整体回滚。成功时：
+
+        - 文件正文与版本号（强 ETag）原样保留，不触发 PUT 式版本递增；
+        - 集合节点与文件一起迁移，不残留空目录；
+        - 源子树内的锁保留令牌、深度与绝对到期时刻（剩余有效期不变），
+          随对应资源改到新路径；源的祖先锁留在原处并继续覆盖迁移后的资源。
+        """
+        with self.txn() as c:
+            # 同批操作的所有到期判断共用这一个时刻。
+            self._purge_expired(c, self.clock.now())
+
+            source_row = self._resource(c, source)
+            if source_row is None:
+                raise MoveRejected("source_not_found", source)
+
+            if source != "/":
+                parent = source.rsplit("/", 1)[0] or "/"
+                parent_row = self._resource(c, parent)
+                if parent_row is None or not parent_row["is_collection"]:
+                    raise MoveRejected("source_bad_parent", parent)
+
+            if self._resource(c, destination) is not None:
+                raise MoveRejected("destination_exists", destination)
+            if destination != "/":
+                dest_parent_path = destination.rsplit("/", 1)[0] or "/"
+                dest_parent = self._resource(c, dest_parent_path)
+                if dest_parent is None or not dest_parent["is_collection"]:
+                    raise MoveRejected("destination_parent_not_collection", dest_parent_path)
+
+            if source == "/":
+                # 根目录覆盖全部路径（前缀"/"会误匹配根自身以外的所有条目）。
+                subtree = c.execute(
+                    "SELECT * FROM resources ORDER BY path"
+                ).fetchall()
+            else:
+                subtree = c.execute(
+                    "SELECT * FROM resources"
+                    " WHERE path = ? OR substr(path, 1, ?) = ?"
+                    " ORDER BY path",
+                    (source, len(source) + 1, source + "/"),
+                ).fetchall()
+
+            file_rows = [r for r in subtree if not r["is_collection"]]
+
+            # 版本清单必须恰好覆盖源子树内的每个文件；
+            # 每个 ETag 必须与当前强 ETag 完全一致（过期版本 → etag_mismatch）。
+            expected = {r["path"]: etag_str(r["etag"]) for r in file_rows}
+            if set(versions) != set(expected):
+                raise MoveRejected("incomplete_versions", source)
+            for path, wanted in versions.items():
+                if wanted != expected[path]:
+                    raise MoveRejected("etag_mismatch", path)
+
+            lock_rows = c.execute("SELECT * FROM locks").fetchall()
+
+            def covers(depth_infinity: int, lock_path: str, path: str) -> bool:
+                return lock_covers(lock_path, bool(depth_infinity), path)
+
+            required: set[str] = set()
+            for l in lock_rows:
+                within_source = l["path"] == source or is_ancestor(source, l["path"])
+                covers_source = covers(l["depth_infinity"], l["path"], source)
+                # 目标路径尚未存在，只有其祖先（含深度锁）能覆盖它。
+                covers_destination = l["path"] != destination and (
+                    covers(l["depth_infinity"], l["path"], destination)
+                )
+                if within_source or covers_source or covers_destination:
+                    required.add(l["token"])
+            missing = required - tokens
+            if missing:
+                raise MoveRejected("locked", source)
+
+            moved: list[MoveEntry] = []
+            for row in subtree:
+                path = row["path"]
+                target = destination + path[len(source) :]
+                c.execute(
+                    "UPDATE resources SET path = ? WHERE path = ?", (target, path)
+                )
+                moved.append(
+                    MoveEntry(
+                        path,
+                        target,
+                        bool(row["is_collection"]),
+                        None if row["is_collection"] else etag_str(row["etag"]),
+                    )
+                )
+
+            # 源子树内的锁随对应资源迁移；令牌、深度与到期时刻原样保留。
+            # 源的祖先锁不在子树内，路径不变，继续覆盖迁移后的资源。
+            internal = [
+                l for l in lock_rows if l["path"] == source or is_ancestor(source, l["path"])
+            ]
+            for l in internal:
+                target = destination + l["path"][len(source) :]
+                c.execute(
+                    "UPDATE locks SET path = ? WHERE token = ?", (target, l["token"])
+                )
+
+            return moved

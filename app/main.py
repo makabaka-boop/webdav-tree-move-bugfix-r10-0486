@@ -220,14 +220,31 @@ def create_app(db_path: Optional[str] = None, clock=None) -> FastAPI:
 
     @app.post("/api/move", include_in_schema=False)
     async def move(request: Request):
-        from .movement import move_tree
+        from .movement import MoveRequestError, move_tree
+        from .store import MoveRejected
         from fastapi.responses import JSONResponse
 
         try:
-            result = move_tree(ws, await request.json())
-        except (ValueError, KeyError, TypeError) as exc:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse(
+                {"ok": False, "reason": "invalid_json"}, status_code=400
+            )
+        try:
+            result = move_tree(ws, payload)
+        except MoveRequestError as exc:
             return JSONResponse({"ok": False, "reason": str(exc)}, status_code=400)
-        return JSONResponse(result, status_code=200 if result["ok"] else 409)
+        except MoveRejected as exc:
+            status = {
+                "locked": 423,
+                "etag_mismatch": 412,
+                "incomplete_versions": 400,
+            }.get(exc.reason, 409)
+            return JSONResponse(
+                {"ok": False, "reason": exc.reason, "path": exc.path},
+                status_code=status,
+            )
+        return JSONResponse(result, status_code=200)
 
     @app.get("/api/files", include_in_schema=False)
     async def api_files() -> dict:
