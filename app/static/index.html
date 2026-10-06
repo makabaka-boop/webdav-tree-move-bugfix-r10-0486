@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>受限 WebDAV 文本工作区</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 880px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 14px; }
+  pre { background: #f6f8fa; padding: .75rem; overflow: auto; white-space: pre-wrap; }
+  .bar { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; margin: .5rem 0; }
+  #status { margin-left: auto; color: #555; }
+  #conflict { border: 1px solid #d1242f; background: #fff5f5; padding: 1rem; margin-top: 1rem; border-radius: 6px; }
+  button { padding: .3rem .8rem; }
+  code { background: #f0f0f0; padding: 0 .3rem; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1>受限 WebDAV 文本工作区</h1>
+<div class="bar">
+  <select id="fileList"></select>
+  <button id="loadBtn">加载</button>
+  <button id="lockBtn">锁定并编辑</button>
+  <button id="saveBtn" disabled>保存</button>
+  <button id="unlockBtn" disabled>解锁</button>
+  <span id="status">就绪</span>
+</div>
+<div class="bar">
+  <span>ETag：<code id="etag">—</code></span>
+  <span>锁令牌：<code id="lockToken">无</code></span>
+</div>
+<textarea id="editor" rows="16" placeholder="先选择文件并加载"></textarea>
+<div id="conflict" hidden>
+  <h2>保存被拒绝：服务器上已有更新的权威版本</h2>
+  <p>你的本地草稿已保留在编辑框中，并备份到 localStorage（键 <code id="draftKey"></code>）。</p>
+  <p>权威版本（ETag <code id="authEtag"></code>）：</p>
+  <pre id="authoritative"></pre>
+  <button id="useServerBtn">放弃草稿，采用权威版本</button>
+</div>
+<script>
+"use strict";
+const LOCK_XML = '<?xml version="1.0" encoding="utf-8"?>'
+  + '<D:lockinfo xmlns:D="DAV:">'
+  + '<D:lockscope><D:exclusive/></D:lockscope>'
+  + '<D:locktype><D:write/></D:locktype>'
+  + '</D:lockinfo>';
+
+const $ = (id) => document.getElementById(id);
+const state = { path: null, etag: null, lockToken: null };
+
+function setStatus(msg) { $("status").textContent = msg; }
+
+function updateUi() {
+  $("etag").textContent = state.etag || "—";
+  $("lockToken").textContent = state.lockToken || "无";
+  $("saveBtn").disabled = !state.path;
+  $("unlockBtn").disabled = !state.lockToken;
+}
+
+function dav(method, path, options = {}) {
+  return fetch("/dav" + path, { method, ...options });
+}
+
+async function loadFiles() {
+  const r = await fetch("/api/files");
+  const { files } = await r.json();
+  const sel = $("fileList");
+  sel.innerHTML = "";
+  for (const f of files) {
+    const opt = document.createElement("option");
+    opt.value = f;
+    opt.textContent = f;
+    sel.appendChild(opt);
+  }
+}
+
+async function loadFile() {
+  const path = $("fileList").value;
+  const r = await dav("GET", path);
+  if (!r.ok) { setStatus(`加载失败：HTTP ${r.status}`); return; }
+  state.path = path;
+  state.etag = r.headers.get("ETag");
+  $("editor").value = await r.text();
+  $("conflict").hidden = true;
+  const draft = localStorage.getItem("draft:" + path);
+  setStatus(draft ? "已加载（注意：localStorage 中存在未保存的本地草稿备份）" : "已加载");
+  updateUi();
+}
+
+async function lockFile() {
+  if (!state.path) { setStatus("请先加载文件"); return; }
+  const r = await dav("LOCK", state.path, {
+    headers: { "Depth": "0", "Timeout": "Second-300", "Content-Type": "application/xml" },
+    body: LOCK_XML,
+  });
+  if (r.ok) {
+    state.lockToken = r.headers.get("Lock-Token").replace(/[<>]/g, "");
+    setStatus("已锁定，可以安全编辑");
+  } else if (r.status === 423) {
+    setStatus("锁定失败：资源被他人锁定");
+  } else {
+    setStatus(`锁定失败：HTTP ${r.status}`);
+  }
+  updateUi();
+}
+
+async function save() {
+  if (!state.path) return;
+  const headers = { "Content-Type": "text/plain; charset=utf-8" };
+  if (state.etag) headers["If-Match"] = state.etag;
+  if (state.lockToken) headers["If"] = `(<${state.lockToken}>)`;
+  const r = await dav("PUT", state.path, { headers, body: $("editor").value });
+  if (r.ok) {
+    state.etag = r.headers.get("ETag");
+    localStorage.removeItem("draft:" + state.path);
+    $("conflict").hidden = true;
+    setStatus("已保存");
+  } else if (r.status === 412 || r.status === 423 || r.status === 428) {
+    // 冲突：保留本地草稿，拉取并展示权威版本
+    localStorage.setItem("draft:" + state.path, $("editor").value);
+    const g = await dav("GET", state.path);
+    $("authoritative").textContent = await g.text();
+    $("authEtag").textContent = g.headers.get("ETag") || "—";
+    $("draftKey").textContent = "draft:" + state.path;
+    $("conflict").hidden = false;
+    setStatus(`保存被拒绝（HTTP ${r.status}）：已保留本地草稿并显示权威版本`);
+  } else {
+    setStatus(`保存失败：HTTP ${r.status}`);
+  }
+  updateUi();
+}
+
+async function unlock() {
+  if (!state.lockToken) return;
+  const r = await dav("UNLOCK", state.path, { headers: { "Lock-Token": `<${state.lockToken}>` } });
+  if (r.ok) {
+    setStatus("已解锁");
+  } else {
+    // 令牌可能已过期；服务端锁状态不受影响
+    setStatus(`解锁返回 HTTP ${r.status}（令牌可能已过期）`);
+  }
+  state.lockToken = null;
+  updateUi();
+}
+
+$("loadBtn").addEventListener("click", loadFile);
+$("lockBtn").addEventListener("click", lockFile);
+$("saveBtn").addEventListener("click", save);
+$("unlockBtn").addEventListener("click", unlock);
+$("useServerBtn").addEventListener("click", () => {
+  $("editor").value = $("authoritative").textContent;
+  state.etag = $("authEtag").textContent;
+  localStorage.removeItem("draft:" + state.path);
+  $("conflict").hidden = true;
+  setStatus("已采用权威版本，本地草稿已丢弃");
+  updateUi();
+});
+
+loadFiles().then(updateUi);
+</script>
+</body>
+</html>

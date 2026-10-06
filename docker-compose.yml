@@ -1,0 +1,13 @@
+services:
+  webdav:
+    build: .
+    ports:
+      - "8080:8000"
+    environment:
+      DB_PATH: /data/workspace.db
+    volumes:
+      - webdav-data:/data
+    restart: unless-stopped
+
+volumes:
+  webdav-data:
